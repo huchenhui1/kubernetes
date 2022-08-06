@@ -405,6 +405,7 @@ const (
 
 // NewControllerInitializers is a public map of named controller groups (you can start more than one in an init func)
 // paired to their InitFunc.  This allows for structured downstream composition and subdivision.
+// kube-controller-manager启动时会initial一堆的controllers
 func NewControllerInitializers(loopMode ControllerLoopMode) map[string]InitFunc {
 	controllers := map[string]InitFunc{}
 	controllers["endpoint"] = startEndpointController
@@ -420,6 +421,7 @@ func NewControllerInitializers(loopMode ControllerLoopMode) map[string]InitFunc 
 	controllers["job"] = startJobController
 	controllers["deployment"] = startDeploymentController
 	controllers["replicaset"] = startReplicaSetController
+	// 在kube-controller-manager启动时完成初始化并启动的，由startHPAController启动
 	controllers["horizontalpodautoscaling"] = startHPAController
 	controllers["disruption"] = startDisruptionController
 	controllers["statefulset"] = startStatefulSetController

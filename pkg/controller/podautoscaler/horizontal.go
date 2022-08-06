@@ -72,14 +72,16 @@ type timestampedScaleEvent struct {
 // in the system with the actual deployments/replication controllers they
 // control.
 type HorizontalController struct {
+	// scaleNamespacer其实是一个ScaleInterface，包括Scale subresource的Get和Update接口。Scale定义了缩放动作，在staging/src/k8s.io/api/autoscaling/v1/types.go
 	scaleNamespacer scaleclient.ScalesGetter
+	// hpaNamespacer是HorizontalPodAutoscalerInterface，包括HorizontalPodAutoscaler的Create, Update, UpdateStatus, Delete, Get, List, Watch等接口。
 	hpaNamespacer   autoscalingclient.HorizontalPodAutoscalersGetter
 	mapper          apimeta.RESTMapper
 
-	replicaCalc   *ReplicaCalculator
+	replicaCalc   *ReplicaCalculator // replicaCalc根据Heapster提供的监控数据，计算对应desired replicas。
 	eventRecorder record.EventRecorder
 
-	downscaleStabilisationWindow time.Duration
+	downscaleStabilisationWindow time.Duration // 缩容操作稳定时间窗口
 
 	// hpaLister is able to list/get HPAs from the shared cache from the informer passed in to
 	// NewHorizontalController.
@@ -95,7 +97,7 @@ type HorizontalController struct {
 	queue workqueue.RateLimitingInterface
 
 	// Latest unstabilized recommendations for each autoscaler.
-	recommendations map[string][]timestampedRecommendation
+	recommendations map[string][]timestampedRecommendation // 每个HPA的伸缩建议数组
 
 	// Latest autoscaler events
 	scaleUpEvents   map[string][]timestampedScaleEvent
@@ -123,6 +125,7 @@ func NewHorizontalController(
 	broadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: evtNamespacer.Events("")})
 	recorder := broadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "horizontal-pod-autoscaler"})
 
+	// 构建HPA Controller
 	hpaController := &HorizontalController{
 		eventRecorder:                recorder,
 		scaleNamespacer:              scaleNamespacer,
@@ -135,20 +138,24 @@ func NewHorizontalController(
 		scaleDownEvents:              map[string][]timestampedScaleEvent{},
 	}
 
+	// 创建Informer，配置对应的ListWatch Func，及其对应的EventHandler，用来监控HPA Resource的Add和Update事件。newInformer是HPA的核心代码入口。
+	// 配置HPA resource event的Handler（AddFunc, UpdateFunc）
 	hpaInformer.Informer().AddEventHandlerWithResyncPeriod(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc:    hpaController.enqueueHPA,
 			UpdateFunc: hpaController.updateHPA,
 			DeleteFunc: hpaController.deleteHPA,
 		},
-		resyncPeriod,
+		resyncPeriod, // // 定义定期List的周期
 	)
+	// 由传入的参数Informer拿到相应的Lister
 	hpaController.hpaLister = hpaInformer.Lister()
 	hpaController.hpaListerSynced = hpaInformer.Informer().HasSynced
 
 	hpaController.podLister = podInformer.Lister()
 	hpaController.podListerSynced = podInformer.Informer().HasSynced
 
+	// 创建ReplicaCaculator，后面会用它来计算desired replicas。
 	replicaCalc := NewReplicaCalculator(
 		metricsClient,
 		hpaController.podLister,
@@ -245,9 +252,11 @@ func (a *HorizontalController) processNextWorkItem() bool {
 // computeReplicasForMetrics computes the desired number of replicas for the metric specifications listed in the HPA,
 // returning the maximum  of the computed replica counts, a description of the associated metric, and the statuses of
 // all metrics computed.
+// computeReplicasForMetrics为HPA中列出的指标规范计算所需的副本数量，返回计算出的副本计数的最大值replicas、关联指标的描述metric以及计算出的所有指标的状态statuses。
 func (a *HorizontalController) computeReplicasForMetrics(hpa *autoscalingv2.HorizontalPodAutoscaler, scale *autoscalingv1.Scale,
 	metricSpecs []autoscalingv2.MetricSpec) (replicas int32, metric string, statuses []autoscalingv2.MetricStatus, timestamp time.Time, err error) {
 
+	// scale子资源的目标伸缩对象(Deployment等)没有Selector
 	if scale.Status.Selector == "" {
 		errMsg := "selector is required"
 		a.eventRecorder.Event(hpa, v1.EventTypeWarning, "SelectorRequired", errMsg)
@@ -263,8 +272,10 @@ func (a *HorizontalController) computeReplicasForMetrics(hpa *autoscalingv2.Hori
 		return 0, "", nil, time.Time{}, fmt.Errorf(errMsg)
 	}
 
+	// 伸缩对象期望的副本数量specReplicas和当前的副本数量statusReplicas
 	specReplicas := scale.Spec.Replicas
 	statusReplicas := scale.Status.Replicas
+	// 指标状态数组
 	statuses = make([]autoscalingv2.MetricStatus, len(metricSpecs))
 
 	invalidMetricsCount := 0
@@ -272,8 +283,9 @@ func (a *HorizontalController) computeReplicasForMetrics(hpa *autoscalingv2.Hori
 	var invalidMetricCondition autoscalingv2.HorizontalPodAutoscalerCondition
 
 	for i, metricSpec := range metricSpecs {
+		// 计算每个指标建议的期望副本数量，statuses作为参数传入，返回建议的副本数量、相应的指标名称、时间
 		replicaCountProposal, metricNameProposal, timestampProposal, condition, err := a.computeReplicasForMetric(hpa, metricSpec, specReplicas, statusReplicas, selector, &statuses[i])
-
+		// 如果计算报错，则计数无效指标加一
 		if err != nil {
 			if invalidMetricsCount <= 0 {
 				invalidMetricCondition = condition
@@ -281,6 +293,7 @@ func (a *HorizontalController) computeReplicasForMetrics(hpa *autoscalingv2.Hori
 			}
 			invalidMetricsCount++
 		}
+		// 更新副本数量最大值、相应的指标名称、时间
 		if err == nil && (replicas == 0 || replicaCountProposal > replicas) {
 			timestamp = timestampProposal
 			replicas = replicaCountProposal
@@ -291,21 +304,28 @@ func (a *HorizontalController) computeReplicasForMetrics(hpa *autoscalingv2.Hori
 	// If all metrics are invalid or some are invalid and we would scale down,
 	// return an error and set the condition of the hpa based on the first invalid metric.
 	// Otherwise set the condition as scaling active as we're going to scale
+	// 所有指标无效或者有指标无效且最大副本数量比当前期望的副本数量少，则把副本数量设为0
+	// 官网：如果任何一个指标无法顺利地计算出扩缩副本数（比如，通过 API 获取指标时出错）， 并且可获取的指标建议缩容，那么本次扩缩会被跳过。
+	// 这表示，如果一个或多个指标给出的 desiredReplicas 值大于当前值，HPA 仍然能实现扩容。
 	if invalidMetricsCount >= len(metricSpecs) || (invalidMetricsCount > 0 && replicas < specReplicas) {
 		setCondition(hpa, invalidMetricCondition.Type, invalidMetricCondition.Status, invalidMetricCondition.Reason, invalidMetricCondition.Message)
 		return 0, "", statuses, time.Time{}, fmt.Errorf("invalid metrics (%v invalid out of %v), first error is: %v", invalidMetricsCount, len(metricSpecs), invalidMetricError)
 	}
+	// 成功从某个指标计算出最大期望副本数量，并返回数量、指标名、所有指标的状态、时间
 	setCondition(hpa, autoscalingv2.ScalingActive, v1.ConditionTrue, "ValidMetricFound", "the HPA was able to successfully calculate a replica count from %s", metric)
 	return replicas, metric, statuses, timestamp, nil
 }
 
 // Computes the desired number of replicas for a specific hpa and metric specification,
 // returning the metric status and a proposed condition to be set on the HPA object.
+// 针对每种类型指标，计算由单个指标需要的期望pod数量。返回建议的副本数量，指标名称，时间
 func (a *HorizontalController) computeReplicasForMetric(hpa *autoscalingv2.HorizontalPodAutoscaler, spec autoscalingv2.MetricSpec,
 	specReplicas, statusReplicas int32, selector labels.Selector, status *autoscalingv2.MetricStatus) (replicaCountProposal int32, metricNameProposal string,
 	timestampProposal time.Time, condition autoscalingv2.HorizontalPodAutoscalerCondition, err error) {
 
+	// 每种指标的处理，参数是当前的期望副本数量、MetricSpec、MetricStatus（回传给上个方法）
 	switch spec.Type {
+	// todo: 没看
 	case autoscalingv2.ObjectMetricSourceType:
 		metricSelector, err := metav1.LabelSelectorAsSelector(spec.Object.Metric.Selector)
 		if err != nil {
@@ -446,8 +466,10 @@ func (a *HorizontalController) computeStatusForResourceMetricGeneric(currentRepl
 	resourceName v1.ResourceName, namespace string, container string, selector labels.Selector) (replicaCountProposal int32,
 	metricStatus *autoscalingv2.MetricValueStatus, timestampProposal time.Time, metricNameProposal string,
 	condition autoscalingv2.HorizontalPodAutoscalerCondition, err error) {
+	// 如果ResourceMetric的target有定义平均值
 	if target.AverageValue != nil {
 		var rawProposal int64
+		// 由replicaCalc来计算副本数量
 		replicaCountProposal, rawProposal, timestampProposal, err := a.replicaCalc.GetRawResourceReplicas(currentReplicas, target.AverageValue.MilliValue(), resourceName, namespace, selector, container)
 		if err != nil {
 			return 0, nil, time.Time{}, "", condition, fmt.Errorf("failed to get %s utilization: %v", resourceName, err)
@@ -458,12 +480,13 @@ func (a *HorizontalController) computeStatusForResourceMetricGeneric(currentRepl
 		}
 		return replicaCountProposal, &status, timestampProposal, metricNameProposal, autoscalingv2.HorizontalPodAutoscalerCondition{}, nil
 	}
-
+	// 既没有设置利用率目标也没有设置值目标，报错
 	if target.AverageUtilization == nil {
 		errMsg := "invalid resource metric source: neither a utilization target nor a value target was set"
 		return 0, nil, time.Time{}, "", condition, fmt.Errorf(errMsg)
 	}
 
+	// 指标目标是资源平均利用率
 	targetUtilization := *target.AverageUtilization
 	replicaCountProposal, percentageProposal, rawProposal, timestampProposal, err := a.replicaCalc.GetResourceReplicas(currentReplicas, targetUtilization, resourceName, namespace, selector, container)
 	if err != nil {
@@ -479,14 +502,17 @@ func (a *HorizontalController) computeStatusForResourceMetricGeneric(currentRepl
 }
 
 // computeStatusForResourceMetric computes the desired number of replicas for the specified metric of type ResourceMetricSourceType.
+// Resource类型
 func (a *HorizontalController) computeStatusForResourceMetric(currentReplicas int32, metricSpec autoscalingv2.MetricSpec, hpa *autoscalingv2.HorizontalPodAutoscaler,
 	selector labels.Selector, status *autoscalingv2.MetricStatus) (replicaCountProposal int32, timestampProposal time.Time,
 	metricNameProposal string, condition autoscalingv2.HorizontalPodAutoscalerCondition, err error) {
+	// 根据当前期望的副本数、MetricSpec的Resource指标的Target（如利用率Utilization）、名称（如cpu），计算建议的副本数、指标值（平均值、利用率）、指标名称、时间
 	replicaCountProposal, metricValueStatus, timestampProposal, metricNameProposal, condition, err := a.computeStatusForResourceMetricGeneric(currentReplicas, metricSpec.Resource.Target, metricSpec.Resource.Name, hpa.Namespace, "", selector)
 	if err != nil {
 		condition = a.getUnableComputeReplicaCountCondition(hpa, "FailedGetResourceMetric", err)
 		return replicaCountProposal, timestampProposal, metricNameProposal, condition, err
 	}
+	// 更新指标status，包括指标类型是ResourceMetric，相应的资源信息是资源名称、值
 	*status = autoscalingv2.MetricStatus{
 		Type: autoscalingv2.ResourceMetricSourceType,
 		Resource: &autoscalingv2.ResourceMetricStatus{
@@ -571,6 +597,7 @@ func (a *HorizontalController) recordInitialRecommendation(currentReplicas int32
 	}
 }
 
+// 调整伸缩：不管hpa resource的event为Add或者update，最终都是调用reconcileAutoscaler来触发
 func (a *HorizontalController) reconcileAutoscaler(hpav1Shared *autoscalingv1.HorizontalPodAutoscaler, key string) error {
 	// make a copy so that we never mutate the shared informer cache (conversion can mutate the object)
 	hpav1 := hpav1Shared.DeepCopy()
@@ -581,6 +608,7 @@ func (a *HorizontalController) reconcileAutoscaler(hpav1Shared *autoscalingv1.Ho
 		return fmt.Errorf("failed to convert the given HPA to %s: %v", autoscalingv2.SchemeGroupVersion.String(), err)
 	}
 	hpa := hpaRaw.(*autoscalingv2.HorizontalPodAutoscaler)
+	// hpa原始状态
 	hpaStatusOriginal := hpa.Status.DeepCopy()
 
 	reference := fmt.Sprintf("%s/%s/%s", hpa.Spec.ScaleTargetRef.Kind, hpa.Namespace, hpa.Spec.ScaleTargetRef.Name)
@@ -606,6 +634,7 @@ func (a *HorizontalController) reconcileAutoscaler(hpav1Shared *autoscalingv1.Ho
 		return fmt.Errorf("unable to determine resource for scale target reference: %v", err)
 	}
 
+	// 获取对应resource的scale subresource数据
 	scale, targetGR, err := a.scaleForResourceMappings(hpa.Namespace, hpa.Spec.ScaleTargetRef.Name, mappings)
 	if err != nil {
 		a.eventRecorder.Event(hpa, v1.EventTypeWarning, "FailedGetScale", err.Error())
@@ -614,6 +643,7 @@ func (a *HorizontalController) reconcileAutoscaler(hpav1Shared *autoscalingv1.Ho
 		return fmt.Errorf("failed to query scale subresource for %s: %v", reference, err)
 	}
 	setCondition(hpa, autoscalingv2.AbleToScale, v1.ConditionTrue, "SucceededGetScale", "the HPA controller was able to get the target's current scale")
+	// 从scale子对象中获取当前资源的期望副本数，没用到当前ScaleStatus
 	currentReplicas := scale.Spec.Replicas
 	a.recordInitialRecommendation(currentReplicas, key)
 
@@ -623,11 +653,13 @@ func (a *HorizontalController) reconcileAutoscaler(hpav1Shared *autoscalingv1.Ho
 		metricName            string
 	)
 
+	// 新的期望的副本数初始值
 	desiredReplicas := int32(0)
 	rescaleReason := ""
 
 	var minReplicas int32
 
+	// 从hpa获取最小副本数量，默认为1
 	if hpa.Spec.MinReplicas != nil {
 		minReplicas = *hpa.Spec.MinReplicas
 	} else {
@@ -639,17 +671,21 @@ func (a *HorizontalController) reconcileAutoscaler(hpav1Shared *autoscalingv1.Ho
 
 	if scale.Spec.Replicas == 0 && minReplicas != 0 {
 		// Autoscaling is disabled for this resource
+		// 最小副本数量为0，且伸缩请求的期望副本数量也为0，不进行scale操作
 		desiredReplicas = 0
 		rescale = false
 		setCondition(hpa, autoscalingv2.ScalingActive, v1.ConditionFalse, "ScalingDisabled", "scaling is disabled since the replica count of the target is zero")
+		// 当前副本数量大于最大副本数量，则将期望副本数量设为最大副本数量
 	} else if currentReplicas > hpa.Spec.MaxReplicas {
 		rescaleReason = "Current number of replicas above Spec.MaxReplicas"
 		desiredReplicas = hpa.Spec.MaxReplicas
+		// 当前副本数量小于最小副本数量，则将期望副本数量设为最小副本数量
 	} else if currentReplicas < minReplicas {
 		rescaleReason = "Current number of replicas below Spec.MinReplicas"
 		desiredReplicas = minReplicas
 	} else {
 		var metricTimestamp time.Time
+		// 指标规范计算所需的副本数量，返回计算出的副本计数的最大值、关联指标的描述以及计算出的所有指标的状态
 		metricDesiredReplicas, metricName, metricStatuses, metricTimestamp, err = a.computeReplicasForMetrics(hpa, scale, hpa.Spec.Metrics)
 		if err != nil {
 			a.setCurrentReplicasInStatus(hpa, currentReplicas)
@@ -663,26 +699,33 @@ func (a *HorizontalController) reconcileAutoscaler(hpav1Shared *autoscalingv1.Ho
 		klog.V(4).Infof("proposing %v desired replicas (based on %s from %s) for %s", metricDesiredReplicas, metricName, metricTimestamp, reference)
 
 		rescaleMetric := ""
+		// 如果根据指标计算得到的副本数大于desiredReplicas(初始为0)，则更新desiredReplicas，并记录指标名称
 		if metricDesiredReplicas > desiredReplicas {
 			desiredReplicas = metricDesiredReplicas
 			rescaleMetric = metricName
 		}
+		// 新的期望副本数大于当前的期望副本数
 		if desiredReplicas > currentReplicas {
 			rescaleReason = fmt.Sprintf("%s above target", rescaleMetric)
 		}
 		if desiredReplicas < currentReplicas {
 			rescaleReason = "All metrics below target"
 		}
+		// v2.beta版本的参数，
 		if hpa.Spec.Behavior == nil {
+			// 使期望副本数标准化
 			desiredReplicas = a.normalizeDesiredReplicas(hpa, key, currentReplicas, desiredReplicas, minReplicas)
 		} else {
+			// todo: 配置了Behaviors下的标准化
 			desiredReplicas = a.normalizeDesiredReplicasWithBehaviors(hpa, key, currentReplicas, desiredReplicas, minReplicas)
 		}
 		rescale = desiredReplicas != currentReplicas
 	}
-
+	// 当desiredReplicas期望副本数调整为最大或最小副本数，或新的期望副本数desiredReplicas和当前期望副本数currentReplicas不一致时，进行伸缩动作
 	if rescale {
+		// 新的期望副本数desiredReplicas更新给scale子对象的期望副本数
 		scale.Spec.Replicas = desiredReplicas
+		// 调用ScaleInterface的Update方法更新给定可伸缩资源的规模
 		_, err = a.scaleNamespacer.Scales(hpa.Namespace).Update(context.TODO(), targetGR, scale, metav1.UpdateOptions{})
 		if err != nil {
 			a.eventRecorder.Eventf(hpa, v1.EventTypeWarning, "FailedRescale", "New size: %d; reason: %s; error: %v", desiredReplicas, rescaleReason, err.Error())
@@ -702,30 +745,36 @@ func (a *HorizontalController) reconcileAutoscaler(hpav1Shared *autoscalingv1.Ho
 		klog.V(4).Infof("decided not to scale %s to %v (last scale time was %s)", reference, desiredReplicas, hpa.Status.LastScaleTime)
 		desiredReplicas = currentReplicas
 	}
-
-	a.setStatus(hpa, currentReplicas, desiredReplicas, metricStatuses, rescale)
-	return a.updateStatusIfNeeded(hpaStatusOriginal, hpa)
+	// 更新这个hpa的状态，当前副本数，期望副本数，最后一次指标值，伸缩时间
+	a.setStatus(hpa, currentReplicas, desiredReplicas, metricStatuses, rescale) // 只是把值更新到hpa遍历
+	return a.updateStatusIfNeeded(hpaStatusOriginal, hpa) // 如果有变化就更新到原来的hpa变量
 }
 
 // stabilizeRecommendation:
 // - replaces old recommendation with the newest recommendation,
 // - returns max of recommendations that are not older than downscaleStabilisationWindow.
+// 官方：在 HPA 控制器执行扩缩操作之前，会记录扩缩建议信息。 控制器会在操作时间窗口中考虑所有的建议信息，并从中选择得分最高的建议
+// 这个配置可以让系统更为平滑地进行缩容操作，从而消除短时间内指标值快速波动产生的影响。
 func (a *HorizontalController) stabilizeRecommendation(key string, prenormalizedDesiredReplicas int32) int32 {
 	maxRecommendation := prenormalizedDesiredReplicas
 	foundOldSample := false
 	oldSampleIndex := 0
 	cutoff := time.Now().Add(-a.downscaleStabilisationWindow)
 	for i, rec := range a.recommendations[key] {
+		// 如果有建议在窗口外，记录第一个下标
 		if rec.timestamp.Before(cutoff) {
 			foundOldSample = true
 			oldSampleIndex = i
+			// 窗口内最大建议的值
 		} else if rec.recommendation > maxRecommendation {
 			maxRecommendation = rec.recommendation
 		}
 	}
+	// 如果有建议在窗口外，则把这个建议的值和时间更新到该位置。最大建议取标准化前的值
 	if foundOldSample {
 		a.recommendations[key][oldSampleIndex] = timestampedRecommendation{prenormalizedDesiredReplicas, time.Now()}
 	} else {
+		// 建议都在窗口内的，把标准化前的值加入建议，返回窗口中最大建议的值
 		a.recommendations[key] = append(a.recommendations[key], timestampedRecommendation{prenormalizedDesiredReplicas, time.Now()})
 	}
 	return maxRecommendation
@@ -734,13 +783,16 @@ func (a *HorizontalController) stabilizeRecommendation(key string, prenormalized
 // normalizeDesiredReplicas takes the metrics desired replicas value and normalizes it based on the appropriate conditions (i.e. < maxReplicas, >
 // minReplicas, etc...)
 func (a *HorizontalController) normalizeDesiredReplicas(hpa *autoscalingv2.HorizontalPodAutoscaler, key string, currentReplicas int32, prenormalizedDesiredReplicas int32, minReplicas int32) int32 {
+	// 标准化建议的期望副本数
 	stabilizedRecommendation := a.stabilizeRecommendation(key, prenormalizedDesiredReplicas)
+	// 建议都在窗口内的，把标准化前的值加入建议，返回窗口中最大建议的值
 	if stabilizedRecommendation != prenormalizedDesiredReplicas {
 		setCondition(hpa, autoscalingv2.AbleToScale, v1.ConditionTrue, "ScaleDownStabilized", "recent recommendations were higher than current one, applying the highest recent recommendation")
 	} else {
+		// 如果有建议在窗口外，则把这个建议的值和时间更新到该位置。最大建议取标准化前的值
 		setCondition(hpa, autoscalingv2.AbleToScale, v1.ConditionTrue, "ReadyForNewScale", "recommended size matches current size")
 	}
-
+	// 根据hpa最小最大副本数、扩容最大速率，标准化期望副本数
 	desiredReplicas, condition, reason := convertDesiredReplicasWithRules(currentReplicas, stabilizedRecommendation, minReplicas, hpa.Spec.MaxReplicas)
 
 	if desiredReplicas == stabilizedRecommendation {
@@ -989,8 +1041,10 @@ func convertDesiredReplicasWithRules(currentReplicas, desiredReplicas, hpaMinRep
 
 	// Do not upscale too much to prevent incorrect rapid increase of the number of master replicas caused by
 	// bogus CPU usage report from heapster/kubelet (like in issue #32304).
+	// 扩容速度限制
 	scaleUpLimit := calculateScaleUpLimit(currentReplicas)
 
+	// 如果hpa的最大副本数量大于扩容速度限制，则最大允许的副本数量为限制，否则为hpa的最大副本数量
 	if hpaMaxReplicas > scaleUpLimit {
 		maximumAllowedReplicas = scaleUpLimit
 		possibleLimitingCondition = "ScaleUpLimit"
@@ -1001,15 +1055,17 @@ func convertDesiredReplicasWithRules(currentReplicas, desiredReplicas, hpaMinRep
 		possibleLimitingReason = "the desired replica count is more than the maximum replica count"
 	}
 
+	// 期望的副本数量小于hpa设置的最小副本数量
 	if desiredReplicas < minimumAllowedReplicas {
 		possibleLimitingCondition = "TooFewReplicas"
 		possibleLimitingReason = "the desired replica count is less than the minimum replica count"
 
 		return minimumAllowedReplicas, possibleLimitingCondition, possibleLimitingReason
 	} else if desiredReplicas > maximumAllowedReplicas {
+		// 期望的副本数量大于hpa设置的最小大副本数量或最大扩容速度限制
 		return maximumAllowedReplicas, possibleLimitingCondition, possibleLimitingReason
 	}
-
+	// 否则期望的副本大小在范围内，直接返回
 	return desiredReplicas, "DesiredWithinRange", "the desired count is within the acceptable range"
 }
 

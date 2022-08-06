@@ -38,6 +38,7 @@ type CrossVersionObjectReference struct {
 type HorizontalPodAutoscalerSpec struct {
 	// reference to scaled resource; horizontal pod autoscaler will learn the current resource consumption
 	// and will set the desired number of pods by using its Scale subresource.
+	// 伸缩的目标，type(deployment等)、name、APIversion
 	ScaleTargetRef CrossVersionObjectReference `json:"scaleTargetRef" protobuf:"bytes,1,opt,name=scaleTargetRef"`
 	// minReplicas is the lower limit for the number of replicas to which the autoscaler
 	// can scale down.  It defaults to 1 pod.  minReplicas is allowed to be 0 if the
@@ -45,12 +46,15 @@ type HorizontalPodAutoscalerSpec struct {
 	// metric is configured.  Scaling is active as long as at least one metric value is
 	// available.
 	// +optional
+	// 最小副本数
 	MinReplicas *int32 `json:"minReplicas,omitempty" protobuf:"varint,2,opt,name=minReplicas"`
 	// upper limit for the number of pods that can be set by the autoscaler; cannot be smaller than MinReplicas.
+	// 最大副本数
 	MaxReplicas int32 `json:"maxReplicas" protobuf:"varint,3,opt,name=maxReplicas"`
 	// target average CPU utilization (represented as a percentage of requested CPU) over all the pods;
 	// if not specified the default autoscaling policy will be used.
 	// +optional
+	// 目标平均CPU利用率
 	TargetCPUUtilizationPercentage *int32 `json:"targetCPUUtilizationPercentage,omitempty" protobuf:"varint,4,opt,name=targetCPUUtilizationPercentage"`
 }
 
@@ -81,6 +85,7 @@ type HorizontalPodAutoscalerStatus struct {
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // configuration of a horizontal pod autoscaler.
+// HPA的配置
 type HorizontalPodAutoscaler struct {
 	metav1.TypeMeta `json:",inline"`
 	// Standard object metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
@@ -89,10 +94,12 @@ type HorizontalPodAutoscaler struct {
 
 	// behaviour of autoscaler. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status.
 	// +optional
+	// HPA的Spec，包括伸缩目标的type、name、apiversion，最小最大伸缩个数，平均CPU使用率阈值
 	Spec HorizontalPodAutoscalerSpec `json:"spec,omitempty" protobuf:"bytes,2,opt,name=spec"`
 
 	// current information about the autoscaler.
 	// +optional
+	// HPA的当前状态数据，包括前后两次scale的时间间隔ObservedGeneration，上一次scale的时间戳LastScaleTime，当前副本数CurrentReplicas，期望副本数DesiredReplicas，hpa对应的所有pods的平均的百分比形式的当前CPU利用率
 	Status HorizontalPodAutoscalerStatus `json:"status,omitempty" protobuf:"bytes,3,opt,name=status"`
 }
 
@@ -112,6 +119,8 @@ type HorizontalPodAutoscalerList struct {
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // Scale represents a scaling request for a resource.
+// Scale表示对资源的伸缩请求
+// 自动扩缩控制器使用 scale 子资源访问相应可支持扩缩的控制器（如副本控制器、 Deployment 和 ReplicaSet）。 scale 是一个可以动态设定副本数量和检查当前状态的接口
 type Scale struct {
 	metav1.TypeMeta `json:",inline"`
 	// Standard object metadata; More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata.
@@ -120,10 +129,12 @@ type Scale struct {
 
 	// defines the behavior of the scale. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status.
 	// +optional
+	// 期望的副本数量
 	Spec ScaleSpec `json:"spec,omitempty" protobuf:"bytes,2,opt,name=spec"`
 
 	// current status of the scale. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status. Read-only.
 	// +optional
+	// 当前的副本数量状态
 	Status ScaleStatus `json:"status,omitempty" protobuf:"bytes,3,opt,name=status"`
 }
 

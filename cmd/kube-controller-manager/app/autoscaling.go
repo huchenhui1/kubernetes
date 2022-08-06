@@ -54,6 +54,7 @@ func startHPAControllerWithRESTClient(ctx ControllerContext) (http.Handler, bool
 		ctx.ComponentConfig.HPAController.HorizontalPodAutoscalerSyncPeriod.Duration,
 		ctx.Stop)
 
+	// HPA Controller需要集群已经部署Heapster，由Heapster提供监控数据，来进行replicas的计算。
 	metricsClient := metrics.NewRESTMetricsClient(
 		resourceclient.NewForConfigOrDie(clientConfig),
 		custom_metrics.NewForConfig(clientConfig, ctx.RESTMapper, apiVersionsGetter),
@@ -74,19 +75,20 @@ func startHPAControllerWithMetricsClient(ctx ControllerContext, metricsClient me
 		return nil, false, err
 	}
 
+	// 创建HPA Controller，并启动goroutine执行其Run方法，开始工作。
 	go podautoscaler.NewHorizontalController(
 		hpaClient.CoreV1(),
 		scaleClient,
 		hpaClient.AutoscalingV1(),
 		ctx.RESTMapper,
 		metricsClient,
-		ctx.InformerFactory.Autoscaling().V1().HorizontalPodAutoscalers(),
-		ctx.InformerFactory.Core().V1().Pods(),
-		ctx.ComponentConfig.HPAController.HorizontalPodAutoscalerSyncPeriod.Duration,
-		ctx.ComponentConfig.HPAController.HorizontalPodAutoscalerDownscaleStabilizationWindow.Duration,
-		ctx.ComponentConfig.HPAController.HorizontalPodAutoscalerTolerance,
-		ctx.ComponentConfig.HPAController.HorizontalPodAutoscalerCPUInitializationPeriod.Duration,
-		ctx.ComponentConfig.HPAController.HorizontalPodAutoscalerInitialReadinessDelay.Duration,
+		ctx.InformerFactory.Autoscaling().V1().HorizontalPodAutoscalers(), // hpaInformer
+		ctx.InformerFactory.Core().V1().Pods(), // podInformer
+		ctx.ComponentConfig.HPAController.HorizontalPodAutoscalerSyncPeriod.Duration, // 扫描周期
+		ctx.ComponentConfig.HPAController.HorizontalPodAutoscalerDownscaleStabilizationWindow.Duration, // 缩容冷却时间窗口长度
+		ctx.ComponentConfig.HPAController.HorizontalPodAutoscalerTolerance, // 伸缩比例容忍
+		ctx.ComponentConfig.HPAController.HorizontalPodAutoscalerCPUInitializationPeriod.Duration, // Pod 的初始化时间
+		ctx.ComponentConfig.HPAController.HorizontalPodAutoscalerInitialReadinessDelay.Duration, // Pod 准备时间
 	).Run(ctx.Stop)
 	return nil, true, nil
 }

@@ -41,9 +41,9 @@ const (
 
 // ReplicaCalculator bundles all needed information to calculate the target amount of replicas
 type ReplicaCalculator struct {
-	metricsClient                 metricsclient.MetricsClient
-	podLister                     corelisters.PodLister
-	tolerance                     float64
+	metricsClient                 metricsclient.MetricsClient // 获取指标的值
+	podLister                     corelisters.PodLister // 获取pod
+	tolerance                     float64 // 变化容忍度
 	cpuInitializationPeriod       time.Duration
 	delayOfInitialReadinessStatus time.Duration
 }
@@ -61,6 +61,7 @@ func NewReplicaCalculator(metricsClient metricsclient.MetricsClient, podLister c
 
 // GetResourceReplicas calculates the desired replica count based on a target resource utilization percentage
 // of the given resource for pods matching the given selector in the given namespace, and the current replica count
+// 用在ResourceMetric的指标目标是资源平均利用率
 func (c *ReplicaCalculator) GetResourceReplicas(currentReplicas int32, targetUtilization int32, resource v1.ResourceName, namespace string, selector labels.Selector, container string) (replicaCount int32, utilization int32, rawUtilization int64, timestamp time.Time, err error) {
 	metrics, timestamp, err := c.metricsClient.GetResourceMetric(resource, namespace, selector, container)
 	if err != nil {
@@ -150,7 +151,9 @@ func (c *ReplicaCalculator) GetResourceReplicas(currentReplicas int32, targetUti
 
 // GetRawResourceReplicas calculates the desired replica count based on a target resource utilization (as a raw milli-value)
 // for pods matching the given selector in the given namespace, and the current replica count
+// 用在ResourceMetric的指标目标是资源平均值，调用calcPlainMetricReplicas
 func (c *ReplicaCalculator) GetRawResourceReplicas(currentReplicas int32, targetUtilization int64, resource v1.ResourceName, namespace string, selector labels.Selector, container string) (replicaCount int32, utilization int64, timestamp time.Time, err error) {
+	// 从metricsClient得到资源指标，从metricsClient得到资源指标是ReplicaCalculator的成员
 	metrics, timestamp, err := c.metricsClient.GetResourceMetric(resource, namespace, selector, container)
 	if err != nil {
 		return 0, 0, time.Time{}, fmt.Errorf("unable to get metrics for resource %s: %v", resource, err)
@@ -163,6 +166,7 @@ func (c *ReplicaCalculator) GetRawResourceReplicas(currentReplicas int32, target
 // GetMetricReplicas calculates the desired replica count based on a target metric utilization
 // (as a milli-value) for pods matching the given selector in the given namespace, and the
 // current replica count
+// 用在PodsMetric，调用了calcPlainMetricReplicas
 func (c *ReplicaCalculator) GetMetricReplicas(currentReplicas int32, targetUtilization int64, metricName string, namespace string, selector labels.Selector, metricSelector labels.Selector) (replicaCount int32, utilization int64, timestamp time.Time, err error) {
 	metrics, timestamp, err := c.metricsClient.GetRawMetric(metricName, namespace, selector, metricSelector)
 	if err != nil {
@@ -174,8 +178,11 @@ func (c *ReplicaCalculator) GetMetricReplicas(currentReplicas int32, targetUtili
 }
 
 // calcPlainMetricReplicas calculates the desired replicas for plain (i.e. non-utilization percentage) metrics.
+// 为普通度量(即未利用百分比)计算所需的副本。
+// 官网有细节解释
 func (c *ReplicaCalculator) calcPlainMetricReplicas(metrics metricsclient.PodMetricsInfo, currentReplicas int32, targetUtilization int64, namespace string, selector labels.Selector, resource v1.ResourceName) (replicaCount int32, utilization int64, err error) {
 
+	// 通过podLister拿到对应标签的pod列表
 	podList, err := c.podLister.Pods(namespace).List(selector)
 	if err != nil {
 		return 0, 0, fmt.Errorf("unable to get pods while calculating replica count: %v", err)
@@ -185,6 +192,10 @@ func (c *ReplicaCalculator) calcPlainMetricReplicas(metrics metricsclient.PodMet
 		return 0, 0, fmt.Errorf("no pods returned by selector while calculating replica count")
 	}
 
+	// 分组，把未就绪的、删除的失败的pod的指标删除（missing的pod已经没找到指标）
+	// 所有被标记了删除时间戳（Pod 正在关闭过程中）的 Pod 和失败的 Pod 都会被忽略。
+	// 如果某个 Pod 缺失度量值，它将会被搁置，只在最终确定扩缩数量时再考虑。
+	// 当使用 CPU 指标来扩缩时，任何还未就绪（例如还在初始化）状态的 Pod 或 最近的指标 度量值采集于就绪状态前的 Pod，该 Pod 也会被搁置。
 	readyPodCount, unreadyPods, missingPods, ignoredPods := groupPods(podList, metrics, resource, c.cpuInitializationPeriod, c.delayOfInitialReadinessStatus)
 	removeMetricsForPods(metrics, ignoredPods)
 	removeMetricsForPods(metrics, unreadyPods)
@@ -192,29 +203,34 @@ func (c *ReplicaCalculator) calcPlainMetricReplicas(metrics metricsclient.PodMet
 	if len(metrics) == 0 {
 		return 0, 0, fmt.Errorf("did not receive metrics for any ready pods")
 	}
-
+	// 指标平均值和目标值的比例，指标平均值
 	usageRatio, utilization := metricsclient.GetMetricUtilizationRatio(metrics, targetUtilization)
 
+	// 有未就绪的pod，并在扩展时
 	rebalanceIgnored := len(unreadyPods) > 0 && usageRatio > 1.0
 
 	if !rebalanceIgnored && len(missingPods) == 0 {
 		if math.Abs(1.0-usageRatio) <= c.tolerance {
 			// return the current replicas if the change would be too small
+			// 如果更改太小，则返回当前副本数
 			return currentReplicas, utilization, nil
 		}
 
 		// if we don't have any unready or missing pods, we can calculate the new replica count now
+		// 如果没有任何未准备或丢失的pod，可以计算新的副本计数:比例*就绪的pod数量 上取整，返回
 		return int32(math.Ceil(usageRatio * float64(readyPodCount))), utilization, nil
 	}
 
 	if len(missingPods) > 0 {
 		if usageRatio < 1.0 {
 			// on a scale-down, treat missing pods as using 100% of the resource request
+			// 在收缩时，将丢失的pod视为使用了100%的资源请求
 			for podName := range missingPods {
 				metrics[podName] = metricsclient.PodMetric{Value: targetUtilization}
 			}
 		} else {
 			// on a scale-up, treat missing pods as using 0% of the resource request
+			// 在扩展中，将丢失的豆荚视为使用了0%的资源请求
 			for podName := range missingPods {
 				metrics[podName] = metricsclient.PodMetric{Value: 0}
 			}
@@ -223,28 +239,34 @@ func (c *ReplicaCalculator) calcPlainMetricReplicas(metrics metricsclient.PodMet
 
 	if rebalanceIgnored {
 		// on a scale-up, treat unready pods as using 0% of the resource request
+		// 在扩展中，将未准备好的pod视为使用了0%的资源请求
 		for podName := range unreadyPods {
 			metrics[podName] = metricsclient.PodMetric{Value: 0}
 		}
 	}
 
 	// re-run the utilization calculation with our new numbers
+	// 为了在一定程度上抑制扩缩的幅度，假设未准备好的、丢失的pod的指标后，再算一次比例，返回的指标平均值不用了
 	newUsageRatio, _ := metricsclient.GetMetricUtilizationRatio(metrics, targetUtilization)
 
 	if math.Abs(1.0-newUsageRatio) <= c.tolerance || (usageRatio < 1.0 && newUsageRatio > 1.0) || (usageRatio > 1.0 && newUsageRatio < 1.0) {
 		// return the current replicas if the change would be too small,
 		// or if the new usage ratio would cause a change in scale direction
+		// 如果更改太小（当前平均值和目标值的比例），或两次伸缩方向不一样，则返回当前副本数
 		return currentReplicas, utilization, nil
 	}
 
+	// 新的副本数量为新的比例*所有pod数量
 	newReplicas := int32(math.Ceil(newUsageRatio * float64(len(metrics))))
 	if (newUsageRatio < 1.0 && newReplicas > currentReplicas) || (newUsageRatio > 1.0 && newReplicas < currentReplicas) {
 		// return the current replicas if the change of metrics length would cause a change in scale direction
+		// 如果度量长度的改变会导致缩放方向的改变，则返回当前的副本
 		return currentReplicas, utilization, nil
 	}
 
 	// return the result, where the number of replicas considered is
 	// however many replicas factored into our calculation
+	// 平均值用的第一次计算的
 	return newReplicas, utilization, nil
 }
 
@@ -379,6 +401,7 @@ func groupPods(pods []*v1.Pod, metrics metricsclient.PodMetricsInfo, resource v1
 	unreadyPods = sets.NewString()
 	ignoredPods = sets.NewString()
 	for _, pod := range pods {
+		// 所有被标记了删除时间戳（Pod 正在关闭过程中）的 Pod 和失败的 Pod 都会被忽略。
 		if pod.DeletionTimestamp != nil || pod.Status.Phase == v1.PodFailed {
 			ignoredPods.Insert(pod.Name)
 			continue
@@ -395,6 +418,7 @@ func groupPods(pods []*v1.Pod, metrics metricsclient.PodMetricsInfo, resource v1
 			continue
 		}
 		// Unready pods are ignored.
+		// 当使用 CPU 指标来扩缩时，任何还未就绪（例如还在初始化）状态的 Pod 或 最近的指标 度量值采集于就绪状态前的 Pod，该 Pod 也会被搁置。
 		if resource == v1.ResourceCPU {
 			var unready bool
 			_, condition := podutil.GetPodCondition(&pod.Status, v1.PodReady)
@@ -402,6 +426,7 @@ func groupPods(pods []*v1.Pod, metrics metricsclient.PodMetricsInfo, resource v1
 				unready = true
 			} else {
 				// Pod still within possible initialisation period.
+				// 在Pod 的初始化时间内的被认为是未就绪
 				if pod.Status.StartTime.Add(cpuInitializationPeriod).After(time.Now()) {
 					// Ignore sample if pod is unready or one window of metric wasn't collected since last state transition.
 					unready = condition.Status == v1.ConditionFalse || metric.Timestamp.Before(condition.LastTransitionTime.Time.Add(metric.Window))

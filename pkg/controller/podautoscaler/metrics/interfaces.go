@@ -32,6 +32,7 @@ type PodMetric struct {
 }
 
 // PodMetricsInfo contains pod metrics as a map from pod names to PodMetricsInfo
+// pod的名字为key，指标信息为value
 type PodMetricsInfo map[string]PodMetric
 
 // MetricsClient knows how to query a remote interface to retrieve container-level

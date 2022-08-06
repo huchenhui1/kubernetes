@@ -95,6 +95,7 @@ type CrossVersionObjectReference struct {
 
 // MetricSpec specifies how to scale based on a single metric
 // (only `type` and one other matching field should be set at once).
+// MetricSpec指定如何基于单个指标进行扩展，多种指标类型
 type MetricSpec struct {
 	// type is the type of metric source.  It should be one of "ContainerResource", "External",
 	// "Object", "Pods" or "Resource", each mapping to a matching field in the object.
@@ -117,6 +118,7 @@ type MetricSpec struct {
 	// Kubernetes, and have special scaling options on top of those available
 	// to normal per-pod metrics using the "pods" source.
 	// +optional
+	// 资源指标
 	Resource *ResourceMetricSource `json:"resource,omitempty" protobuf:"bytes,4,opt,name=resource"`
 	// container resource refers to a resource metric (such as those specified in
 	// requests and limits) known to Kubernetes describing a single container in
@@ -125,6 +127,7 @@ type MetricSpec struct {
 	// available to normal per-pod metrics using the "pods" source.
 	// This is an alpha feature and can be enabled by the HPAContainerMetrics feature flag.
 	// +optional
+	// 容器资源指标
 	ContainerResource *ContainerResourceMetricSource `json:"containerResource,omitempty" protobuf:"bytes,7,opt,name=containerResource"`
 	// external refers to a global metric that is not associated
 	// with any Kubernetes object. It allows autoscaling based on information
@@ -132,6 +135,7 @@ type MetricSpec struct {
 	// (for example length of queue in cloud messaging service, or
 	// QPS from loadbalancer running outside of cluster).
 	// +optional
+	// 外部指标
 	External *ExternalMetricSource `json:"external,omitempty" protobuf:"bytes,5,opt,name=external"`
 }
 

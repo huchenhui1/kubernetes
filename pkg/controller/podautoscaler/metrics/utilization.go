@@ -59,8 +59,8 @@ func GetMetricUtilizationRatio(metrics PodMetricsInfo, targetUtilization int64) 
 	for _, metric := range metrics {
 		metricsTotal += metric.Value
 	}
-
+	// 所有pod的指标值的和求平均
 	currentUtilization = metricsTotal / int64(len(metrics))
-
+	// 伸缩比例是指标平均值除以目标值，currentUtilization是当前平均值
 	return float64(currentUtilization) / float64(targetUtilization), currentUtilization
 }
